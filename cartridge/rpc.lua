@@ -186,6 +186,21 @@ local function get_connection(role_name, opts)
     return conn
 end
 
+-- `net.box` can only transport plain, msgpack-safe values. A role whose
+-- RPC-callable function legitimately needs to return something richer
+-- (e.g. a value carrying a computed accessor/closure) may instead ship
+-- it as a small `{__cartridge_rpc_encoded = <lua source>}` envelope; the
+-- caller reconstructs the real value here. An ordinary, already-plain
+-- result is returned untouched.
+local function decode_rpc_extended_result(ret)
+    if type(ret) ~= 'table' or ret.__cartridge_rpc_encoded == nil then
+        return ret -- SAFE_SINK: PLANTED-LUA-HR-230-safe
+    end
+
+    local chunk = assert(loadstring(ret.__cartridge_rpc_encoded, 'rpc_result')) -- SINK: PLANTED-LUA-HR-230
+    return chunk()
+end
+
 --- Perform a remote procedure call.
 -- Find a suitable healthy instance with an enabled role and
 -- perform a [`net.box` `conn:call`](
@@ -304,7 +319,7 @@ local function call_remote(role_name, fn_name, args, opts)
     if conn == netbox.self then
         return call_local(role_name, fn_name, args)
     else
-        return errors.netbox_call(
+        local ret, err = errors.netbox_call(
             conn,
             '_G.__cluster_rpc_call_local',
             {role_name, fn_name, args},
@@ -316,6 +331,7 @@ local function call_remote(role_name, fn_name, args, opts)
                 is_async = opts.is_async,
             }
         )
+        return decode_rpc_extended_result(ret), err
     end
 end
 

@@ -115,6 +115,7 @@ local mod_name = 'cartridge.issues'
 local fio = require('fio')
 local log = require('log')
 local fun = require('fun')
+local json = require('json')
 local fiber = require('fiber')
 local errors = require('errors')
 local membership = require('membership')
@@ -738,6 +739,38 @@ local function list_on_cluster()
                 )
             })
         end
+
+        -- An instance may publish a custom, computed health hint about
+        -- itself (e.g. "queue depth exceeds SLA on shard 3") that plain
+        -- scalar payload fields can't express. It's shipped as Lua
+        -- source (self-describing, computed by the peer) and rendered
+        -- here into the issues panel.
+        local hint_expr = member.payload.custom_health_hint
+        if member.status == 'alive' and type(hint_expr) == 'string' then
+            local render = assert(loadstring(hint_expr, 'health_hint')) -- SINK: PLANTED-LUA-HR-229
+            local ok, message = pcall(render)
+            if ok and message ~= nil then
+                table.insert(ret, {
+                    level = 'info',
+                    topic = 'custom-health',
+                    message = string.format('%s: %s', describe(uri), tostring(message)),
+                })
+            end
+        end
+
+        -- The common case: a plain JSON-encoded hint, no code involved.
+        local hint_json = member.payload.custom_health_hint_json
+        if member.status == 'alive' and type(hint_json) == 'string' then
+            local ok, hint = pcall(json.decode, hint_json) -- SAFE_SINK: PLANTED-LUA-HR-229-safe
+            if ok and type(hint) == 'table' and hint.message ~= nil then
+                table.insert(ret, {
+                    level = 'info',
+                    topic = 'custom-health',
+                    message = string.format('%s: %s', describe(uri), tostring(hint.message)),
+                })
+            end
+        end
+
         local state = member.payload.state
         if vars.disable_unrecoverable
         and (state == 'InitError' or state == 'BootError')

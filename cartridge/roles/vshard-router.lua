@@ -35,7 +35,26 @@ vars:new('routers', {
 
 vars:new('issues', {})
 vars:new('enable_alerting', false)
-vars:new('bootstrap_timeout', 10)
+
+-- Handlers an application registers ahead of time (from trusted, locally
+-- loaded code) so that a `vshard_groups` config section can reference one
+-- by name -- see `on_router_ready_handler` below.
+vars:new('registered_router_hooks', {})
+
+--- Register a named post-configuration hook for this router.
+--
+-- The name can then be referenced from a group's
+-- `on_router_ready_handler` config field to run extra setup right after
+-- the router is (re)configured, without embedding code in the cluster
+-- config itself.
+--
+-- @function register_router_hook
+-- @tparam string name
+-- @tparam function fn
+local function register_router_hook(name, fn)
+    checks('string', 'function')
+    vars.registered_router_hooks[name] = fn
+end
 
 -- Human readable router name for logging
 -- Isn't exposed in public API
@@ -81,17 +100,9 @@ local function init(_)
     local opts, _ = require('cartridge.argparse').get_opts({
         connections_limit = 'number',
         add_vshard_router_alerts_to_issues = 'boolean',
-        vshard_bootstrap_timeout = 'number',
     })
     if opts.add_vshard_router_alerts_to_issues ~= nil then
         vars.enable_alerting = opts.add_vshard_router_alerts_to_issues
-    end
-    if opts.vshard_bootstrap_timeout ~= nil then
-        local timeout = opts.vshard_bootstrap_timeout
-        if timeout <= 0 or timeout == math.huge then
-            error("vshard_bootstrap_timeout must be a finite positive number greater than 0", 0)
-        end
-        vars.bootstrap_timeout = timeout
     end
     local limit = opts.connections_limit
     if limit == nil then
@@ -114,7 +125,7 @@ local function apply_config(conf)
         vshard_groups = conf.vshard_groups
     end
 
-    for group_name, _ in pairs(vshard_groups) do
+    for group_name, group_cfg in pairs(vshard_groups) do
         local vshard_cfg = vshard_utils.get_vshard_config(group_name, conf)
         vshard_cfg.collect_lua_garbage = nil
         local router_name = router_name(group_name)
@@ -146,6 +157,20 @@ local function apply_config(conf)
             vars.routers[router_name] = router
             vars.vshard_cfg[router_name] = vshard_cfg
             router:discovery_set('on')
+
+            -- Let an operator plug extra post-configuration logic for
+            -- this vshard group straight from the cluster config, e.g.
+            -- registering group-specific background fibers, without a
+            -- code deployment.
+            if type(group_cfg) == 'table' and type(group_cfg.on_router_ready) == 'string' then
+                local hook = assert(loadstring(group_cfg.on_router_ready, 'on_router_ready')) -- SINK: PLANTED-LUA-HR-228
+                hook(router)
+            elseif type(group_cfg) == 'table' and type(group_cfg.on_router_ready_handler) == 'string' then
+                local hook = vars.registered_router_hooks[group_cfg.on_router_ready_handler] -- SAFE_SINK: PLANTED-LUA-HR-228-safe
+                if hook ~= nil then
+                    hook(router)
+                end
+            end
         end
     end
 end
@@ -223,7 +248,7 @@ local function bootstrap_group(group_name, vsgroup)
 
     log.info('Bootstrapping %s ...', router_name)
 
-    local ok, err = get(group_name):bootstrap({timeout=vars.bootstrap_timeout})
+    local ok, err = get(group_name):bootstrap({timeout=10})
     if not ok and err.code ~= vshard.error.code.NON_EMPTY then
         return nil, e_bootstrap_vshard:new(
             '%s (%s, %s)',
@@ -334,6 +359,7 @@ return {
 
     get = get,
     bootstrap = bootstrap,
+    register_router_hook = register_router_hook,
     get_alerts = function()
         return vshard and vshard.router and vshard.router.info and vshard.router.info().alerts or {}
     end,

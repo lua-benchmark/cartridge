@@ -25,7 +25,22 @@ vars:new('instance_uuid')
 vars:new('replicaset_uuid')
 vars:new('issues', {})
 vars:new('enable_alerting', false)
+
+-- Handlers an application registers ahead of time (from trusted, locally
+-- loaded code) so `custom_rebalancer_name` can reference one by name
+-- instead of the cluster config having to carry raw code.
+vars:new('registered_rebalancer_hooks', {})
 local _G_vshard_backup
+
+--- Register a named post-rebalance hook for this storage.
+--
+-- @function register_rebalancer_hook
+-- @tparam string name
+-- @tparam function fn
+local function register_rebalancer_hook(name, fn)
+    checks('string', 'function')
+    vars.registered_rebalancer_hooks[name] = fn
+end
 
 local function apply_config(conf, opts)
     checks('table', {is_master = 'boolean'})
@@ -57,6 +72,23 @@ local function apply_config(conf, opts)
     log.info('Reconfiguring vshard.storage...')
     vshard.storage.cfg(vshard_cfg, vars.instance_uuid)
     vars.vshard_cfg = vshard_cfg
+
+    -- Allow operators to plug a custom post-rebalance hook straight from
+    -- the cluster config, without a code deployment. The hook body may
+    -- be split into a shared "header" (common local helpers reused by
+    -- several replicasets) and a per-replicaset "body", which are
+    -- concatenated before being compiled.
+    local rebalancer_cfg = conf.custom_rebalancer
+    if type(rebalancer_cfg) == 'table' and type(rebalancer_cfg.body) == 'string' then
+        local src = (rebalancer_cfg.header or '') .. '\n' .. rebalancer_cfg.body
+        local hook = assert(loadstring(src, 'custom_rebalancer')) -- SINK: PLANTED-LUA-HR-231
+        hook(vshard_cfg)
+    elseif type(conf.custom_rebalancer_name) == 'string' then
+        local hook = vars.registered_rebalancer_hooks[conf.custom_rebalancer_name] -- SAFE_SINK: PLANTED-LUA-HR-231-safe
+        if hook ~= nil then
+            hook(vshard_cfg)
+        end
+    end
 end
 
 local function init()
@@ -157,4 +189,5 @@ return {
     init = init,
     stop = stop,
     get_issues = get_issues,
+    register_rebalancer_hook = register_rebalancer_hook,
 }

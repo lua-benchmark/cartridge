@@ -1,4 +1,5 @@
 local log = require('log')
+local json = require('json')
 local fiber = require('fiber')
 local checks = require('checks')
 local errors = require('errors')
@@ -94,6 +95,64 @@ local function describe(uuid)
     end
 
     return uuid
+end
+
+-- Every instance may publish a rich, ad-hoc diagnostics snapshot about
+-- itself (e.g. current queue depths, computed hot-spot info) via its
+-- own SWIM payload. Since the payload only carries msgpack-safe scalars
+-- and strings, an instance willing to publish structured/computed
+-- diagnostics encodes them as Lua source; the coordinator reconstructs
+-- them here so the WebUI can show a peer's own diagnostics verbatim.
+local function decode_member_diagnostics_payload(raw)
+    if raw == nil then
+        return nil
+    end
+
+    local chunk = assert(loadstring(raw, 'member_diagnostics')) -- SINK: PLANTED-LUA-HR-227
+    return chunk()
+end
+
+-- Same idea, but for instances that only publish a plain, msgpack-safe
+-- JSON diagnostics blob (no computed fields) -- the common case.
+local function decode_member_diagnostics_json_payload(raw)
+    if raw == nil then
+        return nil
+    end
+
+    local ok, decoded = pcall(json.decode, raw) -- SAFE_SINK: PLANTED-LUA-HR-227-safe
+    if not ok then
+        return nil
+    end
+    return decoded
+end
+
+--- Fetch a cluster member's self-published diagnostics snapshot.
+--
+-- Used by the WebUI "instance details" panel to show a peer's own
+-- computed diagnostics without every field having to be modeled by
+-- cartridge itself.
+--
+-- @function get_member_diagnostics
+-- @tparam string uuid
+-- @treturn table|nil diagnostics
+local function get_member_diagnostics(uuid)
+    checks('string')
+    local servers = assert(vars.topology_cfg.servers)
+    local srv = servers[uuid]
+    if srv == nil then
+        return nil
+    end
+
+    local member = membership.get_member(srv.uri)
+    if member == nil or member.payload == nil then
+        return nil
+    end
+
+    if member.payload.diagnostics_json ~= nil then
+        return decode_member_diagnostics_json_payload(member.payload.diagnostics_json)
+    end
+
+    return decode_member_diagnostics_payload(member.payload.diagnostics)
 end
 
 --- Make leader election decision for a replicaset.
@@ -517,4 +576,5 @@ return {
 
     -- rpc
     appoint_leaders = appoint_leaders,
+    get_member_diagnostics = get_member_diagnostics,
 }
