@@ -1,0 +1,298 @@
+local fio = require('fio')
+
+local helpers = require('test.helper')
+local t = require('luatest')
+local g = t.group()
+
+g.before_all(function()
+    g.server = helpers.Server:new({
+        alias = 'master',
+        cluster_cookie = 'oreo',
+        command = helpers.entrypoint('srv_empty'),
+        workdir = fio.tempdir(),
+        advertise_port = 13301,
+        http_port = 8082,
+        net_box_credentials = {user = 'admin', password = ''},
+    })
+    g.server:start()
+
+    g.server:exec(function()
+        rawset(_G, 'apply_mocks', function(topology_draft)
+            local yaml = require('yaml')
+            local members = {}
+            local topology_cfg = {
+                failover = topology_draft.failover,
+                replicasets = {},
+                servers = {},
+            }
+
+            for _, rpl in ipairs(topology_draft) do
+                topology_cfg.replicasets[rpl.uuid] = {
+                    master = rpl[rpl.leader].uuid,
+                    roles = {
+                        [rpl.role] = true,
+                    }
+                }
+
+                for _, srv in ipairs(rpl) do
+                    local uri = srv.uuid
+                    topology_cfg.servers[srv.uuid] = {
+                        uri = uri,
+                        labels = srv.labels,
+                        disabled = srv.disabled or false,
+                        electable = srv.electable ~= false,
+                        replicaset_uuid = rpl.uuid,
+                    }
+
+                    if srv.status == nil then
+                        members[uri] = nil
+                    else
+                        members[uri] = {
+                            uri = uri,
+                            status = srv.status,
+                            payload = {
+                                uuid = srv.uuid,
+                                state = srv.state,
+                                state_prev = srv.state_prev,
+                            }
+                        }
+                    end
+                end
+            end
+
+            local vars = require('cartridge.vars').new('cartridge.confapplier')
+            local ClusterwideConfig = require('cartridge.clusterwide-config')
+            vars.clusterwide_config = ClusterwideConfig.new({
+                ['topology.yml'] = yaml.encode(topology_cfg)
+            }):lock()
+            require('membership').set_payload = function() end
+            local failover = require('cartridge.failover')
+            _G.box = {
+                cfg = setmetatable({
+                    election_mode = 'off',
+                    election_fencing_mode = 'off',
+                }, {
+                    __call = function(self, opts)
+                        for k, v in pairs(opts) do
+                            self[k] = v
+                        end
+                    end,
+                }),
+                space = {},
+                error = box.error,
+                info = {
+                    cluster = {uuid = 'A'},
+                    uuid = 'a1',
+                },
+            }
+            failover.cfg(vars.clusterwide_config)
+
+            package.loaded['membership'].get_member = function(uri)
+                return members[uri]
+            end
+        end)
+    end)
+end)
+
+g.after_all(function()
+    g.server:stop()
+    fio.rmtree(g.server.workdir)
+end)
+
+local draft = {}
+g.before_each(function()
+    draft = {
+        [1] = {
+            uuid = 'A',
+            role = 'target-role',
+            leader = 1,
+            [1] = {
+                uuid = 'a1',
+                status = 'alive',
+                state = 'RolesConfigured',
+            },
+            [2] = {
+                uuid = 'a2',
+                status = 'alive',
+                state = 'RolesConfigured',
+                state_prev = 'ConfiguringRoles'
+            },
+            [3] = {
+                uuid = 'a3',
+                status = 'alive',
+                state = 'ConfiguringRoles',
+                state_prev = "BoxConfigured"
+            },
+            [4] = {
+                uuid = 'a4',
+                status = 'alive',
+                state = 'BoxConfigured',
+                state_prev = "ConnectingFullmesh"
+            }
+        },
+        [2] = {
+            uuid = 'B',
+            leader = 1,
+            role = 'some-other-role',
+            [1] = {
+                uuid = 'b1',
+                status = 'alive',
+                state = 'RolesConfigured',
+            },
+            [2] = {
+                uuid = 'b2',
+                status = 'alive',
+                state = 'RolesConfigured',
+                state_prev = 'ConfiguringRoles'
+            },
+            [3] = {
+                uuid = 'b3',
+                status = 'alive',
+                state = 'ConfiguringRoles',
+                state_prev = "BoxConfigured"
+            },
+            [4] = {
+                uuid = 'b4',
+                status = 'alive',
+                state = 'BoxConfigured',
+                state_prev = "ConnectingFullmesh"
+            }
+        }
+    }
+end)
+
+local function get_candidates(role, opts)
+    return g.server:eval([[
+        local rpc = require('cartridge.rpc')
+        return rpc.get_candidates(...)
+    ]], {role, opts})
+end
+
+local function apply_topology(topology_draft)
+    g.server:call('_G.apply_mocks', {topology_draft})
+end
+
+g.test_all_alive = function()
+    apply_topology(draft)
+
+    local candidates = get_candidates('invalid-role')
+    t.assert_items_equals(candidates, {})
+
+    local candidates = get_candidates('target-role')
+    t.assert_items_equals(candidates, {'a1', 'a2'})
+
+    local candidates = get_candidates('target-role', {leader_only = true})
+    t.assert_items_equals(candidates, {'a1'})
+
+    local candidates = get_candidates('some-other-role')
+    t.assert_items_equals(candidates, {'b1', 'b2'})
+
+    local candidates = get_candidates('some-other-role', {leader_only = true})
+    t.assert_items_equals(candidates, {'b1'})
+end
+
+g.test_failover = function()
+    draft[1][1].status = 'dead'
+    apply_topology(draft)
+
+    local candidates = get_candidates('target-role', {healthy_only = false})
+    t.assert_items_equals(candidates, {'a1', 'a2', 'a3', 'a4'})
+
+    local candidates = get_candidates('target-role')
+    t.assert_items_equals(candidates, {'a2'})
+
+    local candidates = get_candidates('target-role', {leader_only = true, healthy_only = false})
+    t.assert_items_equals(candidates, {'a1'})
+
+    local candidates = get_candidates('target-role', {leader_only = true})
+    t.assert_items_equals(candidates, {})
+
+    draft.failover = true
+    apply_topology(draft)
+
+    local candidates = get_candidates('target-role', {healthy_only = false})
+    t.assert_items_equals(candidates, {'a1', 'a2', 'a3', 'a4'})
+
+    local candidates = get_candidates('target-role')
+    t.assert_items_equals(candidates, {'a2'})
+
+    local candidates = get_candidates('target-role', {leader_only = true, healthy_only = false})
+    t.assert_items_equals(candidates, {'a2'})
+
+    local candidates = get_candidates('target-role', {leader_only = true})
+    t.assert_items_equals(candidates, {'a2'})
+
+    draft.failover = false
+    draft[1][1].status = 'alive'
+    draft[2].role = 'target-role'
+    apply_topology(draft)
+
+    local candidates = get_candidates('target-role')
+    t.assert_items_equals(candidates, {'a1', 'a2', 'b1', 'b2'})
+
+    local candidates = get_candidates('target-role', {leader_only = true})
+    t.assert_items_equals(candidates, {'a1', 'b1'})
+end
+
+g.test_error = function()
+    draft[2].role = 'target-role'
+    draft[2][1].state = 'BootError'
+    apply_topology(draft)
+
+    local candidates = get_candidates('target-role', {healthy_only = false})
+    t.assert_items_equals(candidates, {'a1', 'a2', 'a3', 'a4', 'b1', 'b2', 'b3', 'b4'})
+
+    local candidates = get_candidates('target-role')
+    t.assert_items_equals(candidates, {'a1', 'a2', 'b2'})
+
+    local candidates = get_candidates('target-role', {leader_only = true, healthy_only = false})
+    t.assert_items_equals(candidates, {'a1', 'b1'})
+
+    local candidates = get_candidates('target-role', {leader_only = true})
+    t.assert_items_equals(candidates, {'a1'})
+end
+
+g.test_disabled = function()
+    draft[2].role = 'target-role'
+    draft[2][1].state = 'BootError'
+    draft[1][1].disabled = true
+    draft[1][2].electable = false
+    apply_topology(draft)
+
+    local candidates = get_candidates('target-role', {healthy_only = false})
+    t.assert_items_equals(candidates, {'a2', 'a3', 'a4', 'b1', 'b2', 'b3', 'b4'})
+
+    local candidates = get_candidates('target-role')
+    t.assert_items_equals(candidates, {'a2', 'b2'})
+
+    local candidates = get_candidates('target-role', {leader_only = true, healthy_only = false})
+    t.assert_items_equals(candidates, {'b1', 'a3'})
+
+    local candidates = get_candidates('target-role', {leader_only = true})
+    t.assert_items_equals(candidates, {})
+end
+
+g.test_with_labels = function()
+    draft[1][2].labels = {msk = "dc", spb = 'dc'}
+    draft[2].role = "target-role"
+    draft[2][1].labels = {msk = "dc"}
+    draft[2][2].state = 'BootError'
+    draft[2][2].labels = {msk = "dc"}
+    apply_topology(draft)
+
+    local candidates = get_candidates('target-role', {labels = {msk = "dc"}})
+    t.assert_items_equals(candidates, {'a2', 'b1'})
+
+    local candidates = get_candidates('target-role', {labels = {msk = "dc"}, leader_only = true})
+    t.assert_items_equals(candidates, {'b1'})
+
+    local candidates = get_candidates('target-role', {labels = {spb = "dc"}})
+    t.assert_items_equals(candidates, {'a2'})
+
+    local candidates = get_candidates('target-role', {labels = {msk = "unknown"}})
+    t.assert_items_equals(candidates, {})
+
+    local candidates = get_candidates('target-role', {labels = {msk = "dc"}, healthy_only = false})
+    t.assert_items_equals(candidates, {'a2', 'b1', 'b2'})
+end
+

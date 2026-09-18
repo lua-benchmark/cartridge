@@ -1,0 +1,59 @@
+name: Nightly Test
+
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+env:
+  # Skip building frontend in tt rocks make
+  CMAKE_DUMMY_WEBUI: true
+
+jobs:
+  run-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        tarantool: ["1.10", "2.11"]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: tarantool/setup-tarantool@v3
+        with:
+          tarantool-version: "${{ matrix.tarantool }}"
+          nightly-build: true
+      - name: Setup tt
+        run: |
+          curl -L https://tarantool.io/release/2/installer.sh | sudo bash
+          sudo apt install -y tt
+          tt version
+      - name: Set up etcd
+        uses: tarantool/actions/setup-etcd@master
+        with:
+          version: v2.3.8
+          install-prefix: etcd-v2.3.8
+
+      # Setup luatest
+      - name: Cache rocks
+        uses: actions/cache@v4
+        id: cache-rocks
+        with:
+          path: .rocks/
+          key: nightly-rocks-${{ hashFiles('*.rockspec') }}-04
+      - run: tt rocks install luatest 1.0.1
+        if: steps.cache-rocks.outputs.cache-hit != 'true'
+
+      - run: tt rocks make
+
+      # Stop Mono server. This server starts and listens to 8084 port that is
+      # used for tests.
+      - name: "Stop Mono server"
+        run: sudo kill -9 $(sudo lsof -t -i tcp:8084) || true
+
+      - run: .rocks/bin/luatest -v
+        env:
+          # Prerequisite for some etcd-related tests
+          ETCD_PATH: etcd-v2.3.8/etcd
+
+      # Cleanup cached paths
+      - run: tt rocks remove cartridge

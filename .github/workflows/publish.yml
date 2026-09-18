@@ -1,0 +1,81 @@
+name: Publish
+
+on:
+  push:
+    branches: [master]
+    tags: ["*"]
+
+jobs:
+  version-check:
+    # We need this job to run only on push with tag.
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check module version
+        uses: tarantool/actions/check-module-version@master
+        with:
+          module-name: "cartridge"
+
+  publish-scm-1:
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: tarantool/rocks.tarantool.org/github-action@master
+        with:
+          auth: ${{ secrets.ROCKS_AUTH }}
+          files: cartridge-scm-1.rockspec
+
+  publish-tag:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: version-check
+    runs-on: ubuntu-22.04
+    env:
+      CMAKE_LDOC_FIND_REQUIRED: "YES"
+      CMAKE_SPHINX_FIND_REQUIRED: "YES"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "16.8.0"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.0"
+      - run: python -m pip install -r rst/requirements.txt
+
+      - uses: tarantool/setup-tarantool@v3
+        with:
+          tarantool-version: "2.10"
+      - name: Setup tt
+        run: |
+          curl -L https://tarantool.io/release/2/installer.sh | sudo bash
+          sudo apt install -y tt
+          tt version
+      - run: tt rocks install ldoc
+          --server=https://tarantool.github.io/LDoc/
+      - run: echo $PWD/.rocks/bin >> $GITHUB_PATH
+
+      # Make a release
+      - run: echo TAG=${GITHUB_REF##*/} >> $GITHUB_ENV
+      - run: tt rocks new_version --tag ${{ env.TAG }}
+      - run: tt rocks make cartridge-${{ env.TAG }}-1.rockspec
+      - run: |
+          mkdir -p check-version
+          # get away from repo sources because `cartridge/VERSION.lua`
+          # always returns 'scm-1' and assertion fails
+          pushd check-version
+          tarantool -l cartridge <<SCRIPT
+          assert(cartridge.VERSION == '${{ env.TAG }}',
+            'version mismatch' ..
+            '\nexpected: ' .. '${{ env.TAG }}' ..
+            '\n  actual: ' .. cartridge.VERSION
+          )
+          SCRIPT
+          popd
+      - run: tt rocks pack cartridge ${{ env.TAG }}
+      - uses: tarantool/rocks.tarantool.org/github-action@master
+        with:
+          auth: ${{ secrets.ROCKS_AUTH }}
+          files: |
+            cartridge-${{ env.TAG }}-1.rockspec
+            cartridge-${{ env.TAG }}-1.all.rock

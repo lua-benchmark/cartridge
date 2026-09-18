@@ -1,0 +1,21 @@
+
+msgid "Tarantool Cartridge"
+msgstr "Tarantool Cartridge"
+
+msgid ""
+"**Cluster** management in Tarantool is powered by the Tarantool Cartridge "
+"framework."
+msgstr ""
+"Управление **кластерами** в Tarantool осуществляется с помощью фреймворка "
+"Tarantool Cartridge."
+
+msgid ""
+"Here we explain how you can benefit with Tarantool Cartridge, a framework "
+"for developing, deploying, and managing applications based on Tarantool."
+msgstr ""
+"В этом документе мы объясним, как можно использовать Tarantool Cartridge — "
+"фреймворк для разработки, развертывания и управления приложениями на основе "
+"Tarantool."
+
+msgid "This documentation contains the following sections:"
+msgstr "Этот документ состоит из следующих разделов:"

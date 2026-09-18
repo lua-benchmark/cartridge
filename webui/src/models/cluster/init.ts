@@ -1,0 +1,14 @@
+import './page/init';
+import './server-list/init';
+import './server-details/init';
+import './server-configure/init';
+import './replicaset-configure/init';
+import './rebalancer-configure/init';
+import './rebalancer-mode-configure/init';
+import './server-expel/init';
+import './server-probe/init';
+import './server-suggestions/init';
+import './failover/init';
+import './zones/init';
+import './suggestions/init';
+import './add-labels/init';

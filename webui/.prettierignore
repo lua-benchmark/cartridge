@@ -1,0 +1,3 @@
+/node_modules
+/src/generated/*
+!/src/generated/graphql-typing-ts.ts

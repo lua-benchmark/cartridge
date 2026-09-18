@@ -1,0 +1,301 @@
+name: Backend Test
+
+on:
+  push:
+    paths-ignore:
+      - 'rst/**'
+      - '.github/workflows/*-translation.yml'
+  workflow_dispatch:
+
+env:
+  # Skip building frontend in tt rocks make
+  CMAKE_DUMMY_WEBUI: true
+  # Prerequisite for some etcd-related tests
+  ETCD_PATH: etcd-v2.3.8/etcd
+
+jobs:
+  misc:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '16.8.0'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12.0'
+
+      - name: Install setuptools
+        run: |
+          python -m pip install --upgrade pip setuptools
+
+      # Setup sphinx
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        id: cache-venv
+        with:
+          path: ./venv
+          key: misc-venv-${{ hashFiles('rst/requirements.txt') }}-04
+
+      -
+        run: |
+          python -m venv ./venv && . ./venv/bin/activate
+          pip install -r rst/requirements.txt
+        if: steps.cache-venv.outputs.cache-hit != 'true'
+
+      # Setup tarantool
+      - uses: tarantool/setup-tarantool@v3
+        with:
+          tarantool-version: '1.10'
+
+      - name: Setup tt
+        run: |
+          curl -L https://tarantool.io/release/2/installer.sh | sudo bash
+          sudo apt install -y tt
+          tt version
+
+      # Setup luacheck and ldoc
+      - name: Cache rocks
+        uses: actions/cache@v4
+        id: cache-rocks
+        with:
+          path: .rocks/
+          key: misc-rocks-${{ hashFiles('*.rockspec') }}-03
+      -
+        run: |
+          tt rocks install luacheck
+          tt rocks install ldoc --server=https://tarantool.github.io/LDoc/
+        if: steps.cache-rocks.outputs.cache-hit != 'true'
+
+      # Setup graphql cli
+      - name: Cache npm
+        uses: actions/cache@v4
+        id: cache-npm
+        with:
+          path: node_modules
+          key: npm-03
+      -
+        run: npm install graphql-cli@3.0.14
+        if: steps.cache-npm.outputs.cache-hit != 'true'
+
+      # Run tests
+      - run: .rocks/bin/luacheck .
+      - name: Run tt rocks make
+        run: |
+          . ./venv/bin/activate
+          tt rocks make
+        env:
+          CMAKE_LDOC_FIND_REQUIRED: 'YES'
+          CMAKE_SPHINX_FIND_REQUIRED: 'YES'
+      - run: ./fetch-schema.sh
+      - run: cmake -DJUST_CHECK=YES -P rst/BuildUML.cmake
+
+      # Cleanup cached paths
+      - run: tt rocks remove cartridge
+
+  run-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        tarantool: ['1.10', '2.10', '2.11']
+        etcd: ['v2.3.8']
+        metrics: ['']
+        include:
+          - tarantool: '2.11'
+            etcd: 'v3.5.0'
+            metrics: ''
+          - tarantool: '2.11'
+            etcd: 'v2.3.8'
+            metrics: '1.2.0'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12.0'
+
+      - name: Install setuptools
+        run: |
+          python -m pip install --upgrade pip setuptools
+
+      - uses: actions/checkout@v4
+      - if: matrix.tarantool != 'latest'
+        uses: tarantool/setup-tarantool@v3
+        with:
+          tarantool-version: '${{ matrix.tarantool }}'
+
+      - if: matrix.tarantool == 'latest'
+        run: |
+          curl -L https://tarantool.io/pre-release/2/installer.sh | bash
+          sudo apt-get -y install tarantool
+
+      - name: Set up etcd
+        uses: tarantool/actions/setup-etcd@master
+        with:
+          version: '${{ matrix.etcd }}'
+          install-prefix: etcd-${{ matrix.etcd }}
+
+      - run: echo "ETCD_PATH=etcd-${{ matrix.etcd }}/etcd" >> $GITHUB_ENV
+
+      - name: Setup tt
+        run: |
+          curl -L https://tarantool.io/release/2/installer.sh | sudo bash
+          sudo apt install -y tt
+          tt version
+
+      # Setup luatest
+      - name: Cache rocks
+        uses: actions/cache@v4
+        id: cache-rocks
+        with:
+          path: .rocks/
+          key: test-rocks-${{ hashFiles('*.rockspec') }}-05
+      -
+        run: tt rocks install luatest 1.0.1
+        if: steps.cache-rocks.outputs.cache-hit != 'true'
+
+      # Setup pytest
+      - name: Cache pytest
+        uses: actions/cache@v4
+        id: cache-pytest
+        with:
+          path: ./pytest-venv
+          key: test-venv-${{ hashFiles('test/integration/requirements.txt') }}-05
+
+      - name: Setup pytest
+        run: |
+          python -m venv ./pytest-venv && . ./pytest-venv/bin/activate
+          pip install --upgrade pip setuptools
+          pip install "cython<3.0.0" wheel
+          pip install -r test/integration/requirements.txt
+        if: steps.cache-pytest.outputs.cache-hit != 'true'
+
+      # Setup optional rocks
+      - name: Install metrics
+        if: matrix.metrics != ''
+        run: tt rocks install metrics ${{ matrix.metrics }}
+
+      - run: tt rocks make
+
+      # Stop Mono server. This server starts and listens to 8084 port that is
+      # used for tests.
+      - name: 'Stop Mono server'
+        run: sudo kill -9 $(sudo lsof -t -i tcp:8084) || true
+
+      - uses: nick-fields/retry@v3
+        with:
+          max_attempts: 3
+          retry_on: error
+          timeout_minutes: 30
+          command: |
+            .rocks/bin/luatest -v --fail-fast
+
+      - name: Run pytest -v
+        run: |
+          . ./pytest-venv/bin/activate
+          pytest -v
+
+      # Cleanup cached paths
+      - run: tt rocks remove cartridge
+
+  tests-ee:
+    if: |
+      github.event_name == 'push'
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        sdk-version: [
+          "gc64-2.11.8-0-r706",
+          "nogc64-2.11.8-0-r706",
+          ]
+        etcd: ['v2.3.8', 'v3.5.0']
+      fail-fast: false
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12.0'
+
+      - name: Install setuptools
+        run: |
+          python -m pip install --upgrade pip setuptools
+
+      - uses: actions/checkout@v4
+
+      - name: Cache Tarantool SDK
+        id: cache-sdk
+        uses: actions/cache@v4
+        with:
+          path: tarantool-enterprise
+          key: ${{ matrix.sdk-version }}-1
+
+      - name: Download Tarantool SDK
+        if: steps.cache-sdk.outputs.cache-hit != 'true'
+        run: |
+          ARCHIVE_NAME=tarantool-enterprise-sdk-${{ matrix.sdk-version }}.linux.x86_64.tar.gz
+          curl -O -L \
+            https://tarantool:${{ secrets.CARTRIDGE_SDK_DOWNLOAD_TOKEN }}@download.tarantool.io/enterprise/release/linux/x86_64/2.11/${ARCHIVE_NAME}
+          tar -xzf ${ARCHIVE_NAME}
+          rm -f ${ARCHIVE_NAME}
+          source tarantool-enterprise/env.sh
+      - name: Add SDK to PATH and set TARANTOOL_SDK_PATH variable
+        run: |
+          SDK_PATH="$(realpath tarantool-enterprise)"
+          TT_CLI_REPO_ROCKS="$(realpath tarantool-enterprise)/rocks"
+          echo "${SDK_PATH}" >> ${GITHUB_PATH}
+          echo "TARANTOOL_SDK_PATH=${SDK_PATH}" >> ${GITHUB_ENV}
+          echo "TT_CLI_REPO_ROCKS=${TT_CLI_REPO_ROCKS}" >> ${GITHUB_ENV}
+
+      - name: Set up etcd
+        uses: tarantool/actions/setup-etcd@master
+        with:
+          version: '${{ matrix.etcd }}'
+          install-prefix: etcd-${{ matrix.etcd }}
+
+      - run: echo "ETCD_PATH=etcd-${{ matrix.etcd }}/etcd" >> $GITHUB_ENV
+
+      # Setup luatest
+      - name: 'Install luatest'
+        run: |
+          source tarantool-enterprise/env.sh
+          tt rocks install luatest 1.0.1
+
+      # Setup pytest
+      - name: Cache pytest
+        uses: actions/cache@v4
+        id: cache-pytest
+        with:
+          path: ./pytest-venv
+          key: test-venv-${{ hashFiles('test/integration/requirements.txt') }}-04
+
+      - name: Setup pytest
+        run: |
+          python -m venv ./pytest-venv && . ./pytest-venv/bin/activate
+          pip install --upgrade pip setuptools
+          pip install "cython<3.0.0" wheel
+          pip install -r test/integration/requirements.txt
+        if: steps.cache-pytest.outputs.cache-hit != 'true'
+
+      - name: 'tt rocks make'
+        run: |
+          source tarantool-enterprise/env.sh
+          tt rocks make
+
+      # Stop Mono server. This server starts and listens to 8084 port that is
+      # used for tests.
+      - name: 'Stop Mono server'
+        run: sudo kill -9 $(sudo lsof -t -i tcp:8084) || true
+
+      - uses: nick-fields/retry@v3
+        with:
+          max_attempts: 3
+          retry_on: error
+          timeout_minutes: 30
+          command: |
+            .rocks/bin/luatest -v --fail-fast
+
+      - name: Run pytest -v
+        run: |
+          . ./pytest-venv/bin/activate
+          pytest -v
+
+      # Cleanup cached paths
+      - run: tt rocks remove cartridge
